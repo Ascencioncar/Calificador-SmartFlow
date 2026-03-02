@@ -1,174 +1,110 @@
 const express = require("express");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
+const { sql } = require("@vercel/postgres");
 
 const app = express();
-
-// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 app.use(express.static("public"));
 
-// ─── In-Memory Store (reemplazar con DB en producción) ───────────────────────
-// Para producción usa: Vercel Postgres, PlanetScale, Supabase, MongoDB Atlas, etc.
-let ratings = [];
+// Crea la tabla automáticamente si no existe
+async function initDB() {
+  await sql`
+    CREATE TABLE IF NOT EXISTS ratings (
+      id         UUID PRIMARY KEY,
+      stars      INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+      categories TEXT[],
+      comment    TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+}
+initDB().catch(console.error);
 
-// ─── Helper: calcular estadísticas ───────────────────────────────────────────
-function getStats() {
-  if (ratings.length === 0) {
-    return {
-      total: 0,
-      average: 0,
-      distribution: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 },
-      topCategories: [],
-    };
-  }
-
-  const total = ratings.length;
-  const sum = ratings.reduce((acc, r) => acc + r.stars, 0);
-  const average = parseFloat((sum / total).toFixed(2));
-
-  const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-  ratings.forEach((r) => distribution[r.stars]++);
-
-  const catCount = {};
-  ratings.forEach((r) => {
-    (r.categories || []).forEach((c) => {
-      catCount[c] = (catCount[c] || 0) + 1;
-    });
-  });
-  const topCategories = Object.entries(catCount)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([name, count]) => ({ name, count }));
-
-  return { total, average, distribution, topCategories };
+async function getStats() {
+  const totals = await sql`
+    SELECT COUNT(*)::int AS total, ROUND(AVG(stars)::numeric, 2)::float AS average FROM ratings
+  `;
+  const dist = await sql`
+    SELECT stars, COUNT(*)::int AS count FROM ratings GROUP BY stars ORDER BY stars
+  `;
+  const cats = await sql`
+    SELECT UNNEST(categories) AS name, COUNT(*)::int AS count
+    FROM ratings WHERE categories IS NOT NULL
+    GROUP BY name ORDER BY count DESC LIMIT 5
+  `;
+  const distribution = { 1:0, 2:0, 3:0, 4:0, 5:0 };
+  dist.rows.forEach(r => distribution[r.stars] = r.count);
+  return {
+    total: totals.rows[0].total,
+    average: totals.rows[0].average || 0,
+    distribution,
+    topCategories: cats.rows
+  };
 }
 
-// ─── ROUTES ───────────────────────────────────────────────────────────────────
-
-// POST /api/ratings — Enviar nueva calificación
-app.post("/api/ratings", (req, res) => {
+app.post("/api/ratings", async (req, res) => {
   const { stars, categories, comment } = req.body;
+  if (!stars || stars < 1 || stars > 5)
+    return res.status(400).json({ success: false, error: "Stars debe ser entre 1 y 5." });
 
-  // Validación
-  if (!stars || typeof stars !== "number" || stars < 1 || stars > 5) {
-    return res.status(400).json({
-      success: false,
-      error: "El campo 'stars' es requerido y debe ser un número entre 1 y 5.",
-    });
-  }
+  const id = uuidv4();
+  const cats = Array.isArray(categories) ? categories : [];
+  const msg = typeof comment === "string" ? comment.trim().slice(0, 500) : "";
 
-  const newRating = {
-    id: uuidv4(),
-    stars: Math.round(stars),
-    categories: Array.isArray(categories) ? categories : [],
-    comment: typeof comment === "string" ? comment.trim().slice(0, 500) : "",
-    createdAt: new Date().toISOString(),
-    ip: req.headers["x-forwarded-for"]?.split(",")[0] || req.socket.remoteAddress,
-  };
-
-  ratings.push(newRating);
+  await sql`INSERT INTO ratings (id, stars, categories, comment) VALUES (${id}, ${Math.round(stars)}, ${cats}, ${msg})`;
 
   return res.status(201).json({
     success: true,
-    message: "¡Calificación registrada exitosamente!",
-    data: {
-      id: newRating.id,
-      stars: newRating.stars,
-      categories: newRating.categories,
-      createdAt: newRating.createdAt,
-    },
+    message: "¡Calificación registrada!",
+    data: { id, stars: Math.round(stars), categories: cats, createdAt: new Date().toISOString() }
   });
 });
 
-// GET /api/ratings — Obtener todas las calificaciones (paginado)
-app.get("/api/ratings", (req, res) => {
+app.get("/api/ratings", async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 10));
+  const limit = Math.min(50, parseInt(req.query.limit) || 10);
   const offset = (page - 1) * limit;
 
-  const sortedRatings = [...ratings].sort(
-    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
-  );
-
-  const paginated = sortedRatings.slice(offset, offset + limit).map((r) => ({
-    id: r.id,
-    stars: r.stars,
-    categories: r.categories,
-    comment: r.comment,
-    createdAt: r.createdAt,
-  }));
+  const rows = await sql`SELECT id, stars, categories, comment, created_at FROM ratings ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+  const countRes = await sql`SELECT COUNT(*)::int AS total FROM ratings`;
+  const total = countRes.rows[0].total;
 
   return res.json({
     success: true,
-    data: paginated,
-    pagination: {
-      total: ratings.length,
-      page,
-      limit,
-      totalPages: Math.ceil(ratings.length / limit),
-    },
-    stats: getStats(),
+    data: rows.rows.map(r => ({ id: r.id, stars: r.stars, categories: r.categories, comment: r.comment, createdAt: r.created_at })),
+    pagination: { total, page, limit, totalPages: Math.ceil(total / limit) },
+    stats: await getStats()
   });
 });
 
-// GET /api/ratings/stats — Solo estadísticas
-app.get("/api/ratings/stats", (req, res) => {
-  return res.json({
-    success: true,
-    data: getStats(),
-  });
+app.get("/api/ratings/stats", async (req, res) => {
+  return res.json({ success: true, data: await getStats() });
 });
 
-// GET /api/ratings/:id — Obtener calificación por ID
-app.get("/api/ratings/:id", (req, res) => {
-  const rating = ratings.find((r) => r.id === req.params.id);
-  if (!rating) {
-    return res.status(404).json({ success: false, error: "Calificación no encontrada." });
-  }
-  const { ip, ...safe } = rating;
-  return res.json({ success: true, data: safe });
+app.get("/api/ratings/:id", async (req, res) => {
+  const result = await sql`SELECT * FROM ratings WHERE id = ${req.params.id}`;
+  if (!result.rows.length) return res.status(404).json({ success: false, error: "No encontrada." });
+  const r = result.rows[0];
+  return res.json({ success: true, data: { id: r.id, stars: r.stars, categories: r.categories, comment: r.comment, createdAt: r.created_at } });
 });
 
-// DELETE /api/ratings/:id — Eliminar calificación (requeriría auth en producción)
-app.delete("/api/ratings/:id", (req, res) => {
-  const index = ratings.findIndex((r) => r.id === req.params.id);
-  if (index === -1) {
-    return res.status(404).json({ success: false, error: "Calificación no encontrada." });
-  }
-  ratings.splice(index, 1);
-  return res.json({ success: true, message: "Calificación eliminada." });
+app.delete("/api/ratings/:id", async (req, res) => {
+  const result = await sql`DELETE FROM ratings WHERE id = ${req.params.id} RETURNING id`;
+  if (!result.rows.length) return res.status(404).json({ success: false, error: "No encontrada." });
+  return res.json({ success: true, message: "Eliminada." });
 });
 
-// GET /api/health — Health check
-app.get("/api/health", (req, res) => {
-  return res.json({
-    success: true,
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    totalRatings: ratings.length,
-  });
+app.get("/api/health", async (req, res) => {
+  const c = await sql`SELECT COUNT(*)::int AS total FROM ratings`;
+  return res.json({ success: true, status: "ok", db: "vercel-postgres", totalRatings: c.rows[0].total });
 });
 
-// 404 fallback para /api/*
-app.use("/api/*", (req, res) => {
-  res.status(404).json({ success: false, error: "Ruta no encontrada." });
-});
+app.use("/api/*", (req, res) => res.status(404).json({ success: false, error: "Ruta no encontrada." }));
 
-// ─── Start server (solo para desarrollo local) ───────────────────────────────
-if (process.env.NODE_ENV !== "production" || !process.env.VERCEL) {
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`\n🚀 SmartFlow Rating API corriendo en http://localhost:${PORT}`);
-    console.log(`\n📋 Endpoints disponibles:`);
-    console.log(`   POST   http://localhost:${PORT}/api/ratings`);
-    console.log(`   GET    http://localhost:${PORT}/api/ratings`);
-    console.log(`   GET    http://localhost:${PORT}/api/ratings/stats`);
-    console.log(`   GET    http://localhost:${PORT}/api/ratings/:id`);
-    console.log(`   DELETE http://localhost:${PORT}/api/ratings/:id`);
-    console.log(`   GET    http://localhost:${PORT}/api/health`);
-  });
+if (!process.env.VERCEL) {
+  app.listen(process.env.PORT || 3000, () => console.log("🚀 http://localhost:3000"));
 }
 
 module.exports = app;
